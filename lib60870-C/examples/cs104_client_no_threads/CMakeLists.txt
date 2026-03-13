@@ -1,4 +1,0 @@
-add_executable(cs104_client_no_threads cs104_client_no_threads.c)
-
-target_link_libraries(cs104_client_no_threads PRIVATE lib60870)
-
