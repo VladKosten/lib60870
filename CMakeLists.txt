@@ -1,26 +1,27 @@
 # ==============================================================================
-# Iec60870Lib - Custom embedded CMake target for lib60870-C (CS 101 slave only)
+# Iec60870Lib - Embedded lib60870 target (STM32 + FreeRTOS)
 #
-# This CMakeLists does NOT use the upstream lib60870-C/CMakeLists.txt because
-# that file is designed for host builds (Linux/Win32).  Instead we list only
-# the CS 101 slave sources we need and provide our own STM32/FreeRTOS HAL files.
-#
-# CONFIG_USE_THREADS   = 0  (no OS threads – CS101_Slave_run() called from a
-#                             FreeRTOS task in iec101_startup)
-# CONFIG_USE_SEMAPHORES = 0  (no semaphores needed without threads)
+# We intentionally do not use upstream host-focused CMake.
+# This target builds a focused CS101 stack with STM32 HAL adapters.
 # ==============================================================================
 
 cmake_minimum_required(VERSION 3.16)
 
-set(LIB60870_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/lib60870-C)
+set(LIB60870_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 set(LIB60870_SRC  ${LIB60870_ROOT}/src)
 
-# ------------------------------------------------------------------------------
-# Source file list
-# ------------------------------------------------------------------------------
-set(iec60870_lib_SRCS
+option(LIB60870_USE_THREADS "Enable internal lib60870 worker threads" ON)
+set(LIB60870_FILE_SERVICE_SRC ${LIB60870_SRC}/file-service/file_server.c)
+option(LIB60870_ENABLE_FILE_SERVICE "Enable CS101 file service plugin source" ON)
 
-    # --- IEC 60870-5-101 protocol core ----------------------------------------
+set(LIB60870_CONFIG_USE_THREADS 0)
+set(LIB60870_CONFIG_USE_SEMAPHORES 0)
+if(LIB60870_USE_THREADS)
+    set(LIB60870_CONFIG_USE_THREADS 1)
+    set(LIB60870_CONFIG_USE_SEMAPHORES 1)
+endif()
+
+set(IEC60870_CORE_SRCS
     ${LIB60870_SRC}/iec60870/apl/cpXXtime2a.c
     ${LIB60870_SRC}/iec60870/cs101/cs101_asdu.c
     ${LIB60870_SRC}/iec60870/cs101/cs101_information_objects.c
@@ -32,47 +33,60 @@ set(iec60870_lib_SRCS
     ${LIB60870_SRC}/iec60870/link_layer/serial_transceiver_ft_1_2.c
     ${LIB60870_SRC}/iec60870/frame.c
     ${LIB60870_SRC}/iec60870/lib60870_common.c
+)
 
-    # --- Common utility -------------------------------------------------------
+set(IEC60870_COMMON_SRCS
     ${LIB60870_SRC}/common/linked_list.c
+)
 
-    # --- Platform HAL (STM32 + FreeRTOS) -------------------------------------
+set(IEC60870_HAL_SRCS
     ${LIB60870_SRC}/hal/memory/lib_memory.c
     ${LIB60870_SRC}/hal/serial/stm32/serial_port_stm32.c
-    ${LIB60870_SRC}/hal/time/freertos/hal_time_freertos.c
+    ${LIB60870_SRC}/hal/time/stm32/hal_time_stm32.c
 )
 
-# ------------------------------------------------------------------------------
-# Static library target
-# ------------------------------------------------------------------------------
-add_library(Iec60870Lib STATIC ${iec60870_lib_SRCS})
+if(LIB60870_USE_THREADS)
+    list(APPEND IEC60870_HAL_SRCS
+        ${LIB60870_SRC}/hal/thread/freertos/thread_freertos.c
+    )
+endif()
 
-# PUBLIC include paths – available to consumers (e.g. iec101_startup)
+set(IEC60870_FILE_SERVICE_SRCS)
+if(LIB60870_ENABLE_FILE_SERVICE AND EXISTS ${LIB60870_FILE_SERVICE_SRC})
+    list(APPEND IEC60870_FILE_SERVICE_SRCS
+        ${LIB60870_FILE_SERVICE_SRC}
+    )
+endif()
+
+add_library(Iec60870Lib STATIC
+    ${IEC60870_CORE_SRCS}
+    ${IEC60870_COMMON_SRCS}
+    ${IEC60870_HAL_SRCS}
+    ${IEC60870_FILE_SERVICE_SRCS}
+)
+
 target_include_directories(Iec60870Lib
     PUBLIC
-        ${LIB60870_SRC}/inc/api          # cs101_slave.h, cs101_information_objects.h, …
-        ${LIB60870_SRC}/hal/inc          # hal_serial.h, hal_time.h, lib_memory.h
-        ${LIB60870_SRC}/hal/serial/stm32 # hal_serial_stm32.h (STM32 UART extension)
-        ${LIB60870_ROOT}/config          # lib60870_config.h
-
+        ${LIB60870_SRC}/inc/api
+        ${LIB60870_SRC}/hal/inc
+        ${LIB60870_SRC}/hal/serial/stm32
+        ${CMAKE_SOURCE_DIR}/Core/Inc
     PRIVATE
-        ${LIB60870_SRC}/inc/internal     # internal headers used only by the library sources
-        ${LIB60870_SRC}/common/inc       # linked_list.h
+        ${LIB60870_SRC}/inc/internal
+        ${LIB60870_SRC}/common/inc
 )
 
-# ------------------------------------------------------------------------------
-# Compile definitions
-# ------------------------------------------------------------------------------
+if(LIB60870_ENABLE_FILE_SERVICE AND EXISTS ${LIB60870_FILE_SERVICE_SRC})
+    target_include_directories(Iec60870Lib PUBLIC ${LIB60870_SRC}/file-service)
+endif()
+
 target_compile_definitions(Iec60870Lib
     PUBLIC
-        CONFIG_USE_THREADS=0             # disable thread support – use CS101_Slave_run()
-        CONFIG_USE_SEMAPHORES=0          # disable semaphore support (not needed without threads)
-        CONFIG_DEBUG_OUTPUT=0            # disable printf debug output
+        CONFIG_USE_THREADS=${LIB60870_CONFIG_USE_THREADS}
+        CONFIG_USE_SEMAPHORES=${LIB60870_CONFIG_USE_SEMAPHORES}
+        CONFIG_DEBUG_OUTPUT=0
 )
 
-# ------------------------------------------------------------------------------
-# Dependencies
-# ------------------------------------------------------------------------------
 target_link_libraries(Iec60870Lib
     PUBLIC
         freertos_kernel
