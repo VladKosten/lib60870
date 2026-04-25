@@ -15,8 +15,9 @@
 #include "hal_serial_stm32.h"
 #include "lib_memory.h"
 
-#define SERIAL_PORT_RX_QUEUE_LENGTH 256U
-#define SERIAL_PORT_MAX_INSTANCES   1U
+#define SERIAL_PORT_RX_QUEUE_LENGTH    256U
+#define SERIAL_PORT_MAX_INSTANCES      1U
+#define SERIAL_PORT_RX_DMA_BUFFER_SIZE 512U
 
 struct sSerialPort
 {
@@ -33,7 +34,8 @@ struct sSerialPort
     UART_HandleTypeDef* uartHandle;
 
     QueueHandle_t rxQueue;
-    uint8_t rxByte;
+    uint8_t rxDmaBuffer [SERIAL_PORT_RX_DMA_BUFFER_SIZE];
+    uint16_t rxDmaBufferPos;
 
     SemaphoreHandle_t txDoneSem;
 };
@@ -110,6 +112,16 @@ serialPortApplyUartConfig(SerialPort self)
     if ((self == NULL) || (self->uartHandle == NULL))
         return false;
 
+    /* De-initialize UART first to ensure clean state and proper DMA setup */
+    if (self->uartHandle->gState != HAL_UART_STATE_RESET)
+    {
+        if (HAL_UART_DeInit(self->uartHandle) != HAL_OK)
+        {
+            self->lastError = SERIAL_PORT_ERROR_OPEN_FAILED;
+            return false;
+        }
+    }
+
     uint32_t wordLength = UART_WORDLENGTH_8B;
     uint32_t parity = UART_PARITY_NONE;
     uint32_t stopBits = UART_STOPBITS_1;
@@ -177,7 +189,20 @@ serialPortStartRxInterrupt(SerialPort self)
     if ((self == NULL) || (self->uartHandle == NULL))
         return false;
 
-    HAL_StatusTypeDef status = HAL_UART_Receive_IT(self->uartHandle, &self->rxByte, 1U);
+    /* Clear any pending UART errors and flush RX buffer before starting DMA reception */
+    __HAL_UART_CLEAR_PEFLAG(self->uartHandle);
+    __HAL_UART_CLEAR_FEFLAG(self->uartHandle);
+    __HAL_UART_CLEAR_NEFLAG(self->uartHandle);
+    __HAL_UART_CLEAR_OREFLAG(self->uartHandle);
+    __HAL_UART_FLUSH_DRREGISTER(self->uartHandle);
+
+    /* Enable IDLE interrupt */
+    __HAL_UART_ENABLE_IT(self->uartHandle, UART_IT_IDLE);
+
+    /* Start DMA reception in circular mode */
+    HAL_StatusTypeDef status = HAL_UART_Receive_DMA(self->uartHandle,
+                                                    self->rxDmaBuffer,
+                                                    SERIAL_PORT_RX_DMA_BUFFER_SIZE);
     if (status == HAL_OK)
         return true;
 
@@ -217,6 +242,7 @@ SerialPort_create(const char* interfaceName, int baudRate, uint8_t dataBits, cha
     self->lastError = SERIAL_PORT_ERROR_NONE;
     self->isOpen = false;
     self->uartHandle = NULL;
+    self->rxDmaBufferPos = 0U;
     self->rxQueue = xQueueCreate(SERIAL_PORT_RX_QUEUE_LENGTH, sizeof(uint8_t));
 
     if (self->rxQueue == NULL)
@@ -284,6 +310,21 @@ bool SerialPort_open(SerialPort self)
     if (!serialPortApplyUartConfig(self))
         return false;
 
+#if (USE_HAL_UART_REGISTER_CALLBACKS == 1)
+    /* Register UART callbacks when callback registration is enabled */
+    if (HAL_UART_RegisterCallback(self->uartHandle, HAL_UART_TX_COMPLETE_CB_ID, (pUART_CallbackTypeDef) SerialPort_TxCpltCallback) != HAL_OK)
+    {
+        self->lastError = SERIAL_PORT_ERROR_OPEN_FAILED;
+        return false;
+    }
+
+    if (HAL_UART_RegisterCallback(self->uartHandle, HAL_UART_ERROR_CB_ID, (pUART_CallbackTypeDef) SerialPort_ErrorCallback) != HAL_OK)
+    {
+        self->lastError = SERIAL_PORT_ERROR_OPEN_FAILED;
+        return false;
+    }
+#endif
+
     if (!serialPortRegisterInstance(self))
     {
         self->lastError = SERIAL_PORT_ERROR_OPEN_FAILED;
@@ -315,7 +356,10 @@ void SerialPort_close(SerialPort self)
     serialPortUnregisterInstance(self);
 
     if (self->uartHandle != NULL)
+    {
+        __HAL_UART_DISABLE_IT(self->uartHandle, UART_IT_IDLE);
         (void) HAL_UART_AbortReceive(self->uartHandle);
+    }
 }
 
 int SerialPort_getBaudRate(SerialPort self)
@@ -346,6 +390,10 @@ void SerialPort_discardInBuffer(SerialPort self)
         xQueueReset(self->rxQueue);
 
     __HAL_UART_FLUSH_DRREGISTER(self->uartHandle);
+
+    taskENTER_CRITICAL();
+    self->rxDmaBufferPos = 0U;
+    taskEXIT_CRITICAL();
 
     if (self->isOpen)
         (void) serialPortStartRxInterrupt(self);
@@ -443,26 +491,55 @@ void SerialPort_TxCpltCallback(UART_HandleTypeDef* huart)
     portYIELD_FROM_ISR(higherPriorityTaskWoken);
 }
 
-void SerialPort_RxCpltCallback(UART_HandleTypeDef* huart)
+/**
+ * \brief UART IDLE interrupt callback - called when line goes idle (end of frame).
+ * \details This function extracts received data from DMA buffer and pushes it to the queue.
+ *          Only complete frames are made available for reading.
+ */
+void SerialPort_IdleCallback(UART_HandleTypeDef* huart)
 {
     SerialPort self = serialPortFindByHandle(huart);
 
-    if (self == NULL)
+    if ((self == NULL) || !self->isOpen || (self->rxQueue == NULL))
         return;
 
+    /* Clear IDLE flag */
+    __HAL_UART_CLEAR_IDLEFLAG(huart);
+
+    /* Calculate how many bytes were received */
+    uint16_t dmaCounter = (uint16_t) __HAL_DMA_GET_COUNTER(huart->hdmarx);
+    uint16_t currentPos = SERIAL_PORT_RX_DMA_BUFFER_SIZE - dmaCounter;
+    uint16_t receivedBytes = 0U;
+
+    if (currentPos >= self->rxDmaBufferPos)
+    {
+        receivedBytes = currentPos - self->rxDmaBufferPos;
+    }
+    else
+    {
+        /* Buffer wrapped around */
+        receivedBytes = (SERIAL_PORT_RX_DMA_BUFFER_SIZE - self->rxDmaBufferPos) + currentPos;
+    }
+
+    if (receivedBytes == 0U)
+        return;
+
+    /* Push received frame bytes to the queue */
     BaseType_t higherPriorityTaskWoken = pdFALSE;
 
-    if (self->isOpen && (self->rxQueue != NULL))
+    for (uint16_t i = 0U; i < receivedBytes; i++)
     {
-        if (xQueueSendFromISR(self->rxQueue, &self->rxByte, &higherPriorityTaskWoken) != pdPASS)
+        uint16_t idx = (self->rxDmaBufferPos + i) % SERIAL_PORT_RX_DMA_BUFFER_SIZE;
+
+        if (xQueueSendFromISR(self->rxQueue, &self->rxDmaBuffer [idx], &higherPriorityTaskWoken) != pdPASS)
+        {
             self->lastError = SERIAL_PORT_ERROR_UNKNOWN;
+            break;
+        }
     }
 
-    if (self->isOpen)
-    {
-        if (HAL_UART_Receive_IT(self->uartHandle, &self->rxByte, 1U) != HAL_OK)
-            self->lastError = SERIAL_PORT_ERROR_UNKNOWN;
-    }
+    /* Update buffer position */
+    self->rxDmaBufferPos = currentPos;
 
     portYIELD_FROM_ISR(higherPriorityTaskWoken);
 }
@@ -477,7 +554,13 @@ void SerialPort_ErrorCallback(UART_HandleTypeDef* huart)
     self->lastError = SERIAL_PORT_ERROR_UNKNOWN;
 
     __HAL_UART_CLEAR_OREFLAG(huart);
+    __HAL_UART_CLEAR_PEFLAG(huart);
+    __HAL_UART_CLEAR_FEFLAG(huart);
+    __HAL_UART_CLEAR_NEFLAG(huart);
 
     if (self->isOpen)
-        (void) HAL_UART_Receive_IT(self->uartHandle, &self->rxByte, 1U);
+    {
+        self->rxDmaBufferPos = 0U;
+        (void) HAL_UART_Receive_DMA(self->uartHandle, self->rxDmaBuffer, SERIAL_PORT_RX_DMA_BUFFER_SIZE);
+    }
 }

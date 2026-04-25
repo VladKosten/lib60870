@@ -22,7 +22,7 @@ SerialPort_getUartHandle(SerialPort self);
 
 /* HAL UART callback dispatchers - call these from the global HAL_UART_*Callback functions */
 PAL_API void SerialPort_TxCpltCallback(UART_HandleTypeDef* huart);
-PAL_API void SerialPort_RxCpltCallback(UART_HandleTypeDef* huart);
+PAL_API void SerialPort_IdleCallback(UART_HandleTypeDef* huart);
 PAL_API void SerialPort_ErrorCallback(UART_HandleTypeDef* huart);
 
 #ifdef __cplusplus
