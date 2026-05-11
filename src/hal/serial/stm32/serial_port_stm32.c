@@ -533,12 +533,15 @@ void SerialPort_IdleCallback(UART_HandleTypeDef* huart)
 
         if (xQueueSendFromISR(self->rxQueue, &self->rxDmaBuffer [idx], &higherPriorityTaskWoken) != pdPASS)
         {
+            /* Queue full: discard remaining bytes of this burst but still advance
+             * rxDmaBufferPos below so we don't replay the same stale bytes on the
+             * next IDLE interrupt, which would keep the queue permanently stuck. */
             self->lastError = SERIAL_PORT_ERROR_UNKNOWN;
             break;
         }
     }
 
-    /* Update buffer position */
+    /* Update buffer position regardless of whether all bytes were queued */
     self->rxDmaBufferPos = currentPos;
 
     portYIELD_FROM_ISR(higherPriorityTaskWoken);
@@ -553,14 +556,20 @@ void SerialPort_ErrorCallback(UART_HandleTypeDef* huart)
 
     self->lastError = SERIAL_PORT_ERROR_UNKNOWN;
 
+    /* Clear all UART error flags */
     __HAL_UART_CLEAR_OREFLAG(huart);
     __HAL_UART_CLEAR_PEFLAG(huart);
     __HAL_UART_CLEAR_FEFLAG(huart);
     __HAL_UART_CLEAR_NEFLAG(huart);
+    __HAL_UART_FLUSH_DRREGISTER(huart);
 
     if (self->isOpen)
     {
         self->rxDmaBufferPos = 0U;
-        (void) HAL_UART_Receive_DMA(self->uartHandle, self->rxDmaBuffer, SERIAL_PORT_RX_DMA_BUFFER_SIZE);
+        /* Use serialPortStartRxInterrupt instead of bare HAL_UART_Receive_DMA so
+         * that the UART IDLE interrupt is re-enabled alongside DMA restart.
+         * Without this, after an overrun/framing error the IDLE callback never
+         * fires, rxQueue stops being fed, and the slave goes permanently silent. */
+        (void) serialPortStartRxInterrupt(self);
     }
 }
